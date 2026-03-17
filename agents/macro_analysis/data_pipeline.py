@@ -489,9 +489,7 @@ def fetch_defi_stablecoins() -> Dict[str, Any]:
 
     data = _get(f"{DEFILLAMA_BASE}/v2/stablecoins", timeout=15)
     if not data:
-        data = _get("https://stablecoins.llama.fi/stablecoins", timeout=15)
-    if not data or "peggedAssets" not in data:
-        return {}
+        data = _get("https://stablecoins.llama.fi/stablecoin
 
     stables = data["peggedAssets"]
     top_stables = []
