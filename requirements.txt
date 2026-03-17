@@ -1,42 +1,7 @@
-# ============================================================
-# AI Wallet Agent + Trading System - Python Dependencies
-# ============================================================
-# Install with:  pip install -r requirements.txt
-# ============================================================
-
-# ── Core blockchain ──────────────────────────────────────────
-web3>=6.0.0                  # Ethereum blockchain interaction
-eth-account>=0.11.0          # Ethereum account/key management
-
-# ── Agent framework ──────────────────────────────────────────
-langgraph>=0.2.0             # State-machine agent framework
-langchain-core>=0.1.0        # LangChain core (LangGraph dependency)
-
-# ── Web API ──────────────────────────────────────────────────
-flask>=3.0.0                 # REST API server
-flask-cors>=4.0.0            # Cross-Origin Resource Sharing
-
-# ── HTTP / Networking ────────────────────────────────────────
-requests>=2.31.0             # HTTP calls (Bedrock, CoinGecko, DeFiLlama)
-aiohttp>=3.9.0               # Async HTTP (optional, for future use)
-
-# ── Data & Analysis ──────────────────────────────────────────
-pandas>=2.0.0                # Data manipulation and analysis
-numpy>=1.24.0                # Numerical computing
-
-# ── Scheduler ────────────────────────────────────────────────
-APScheduler>=3.10.0          # Background job scheduler (data refresh)
-
-# ── Environment ──────────────────────────────────────────────
-python-dotenv>=1.0.0         # Load .env variables
-
-# ── MCP (Model Context Protocol) ─────────────────────────────
-mcp>=1.0.0                   # MCP server/client SDK (optional stdio server)
-
-# ── Sentiment Analysis ───────────────────────────────────────
-vaderSentiment>=3.3.2        # VADER NLP — fast crypto news sentiment scoring
-praw>=7.7.0                  # Reddit API (social sentiment from r/ethereum etc)
-pytrends>=4.9.0              # Google Trends (search interest spike detection)
-
-# ── Web scraping / HTML parsing ──────────────────────────────
-lxml>=5.0.0                  # Fast HTML/XML parser (pytrends dependency)
+# ── Core Dependencies ────────────────────────────────────
+langgraph>=0.2.0
+langchain-core>=0.3.0
+flask>=3.0.0
+flask-cors>=4.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0

@@ -1,425 +1,140 @@
 """
 agent_graph.py — LangGraph Agent State Machine
 ================================================
-Routes user messages to the correct handler nodes.
+Routes through the RWA Agent pipeline:
 
-Original nodes (wallet ops):
-  check_user_balance   → ETH balance
-  check_agent_balance  → agent wallet balance
-  transfer_to_agent    → MetaMask transfer
-  create_wallet        → generate new wallet
+  Customer Risk Profiling → Macro Analysis → [Match Asset → ...]
 
-New nodes (trading intelligence):
-  analyze_market       → run full token analysis (20% ROI pipeline)
-  suggest_trades       → build gas/slippage-aware trade plan
-  token_info           → deep analysis of a single token
-  market_status        → fear/greed + top movers summary
-  verify_rwa           → trust score for a specific RWA token
+Nodes:
+  customer_risk_profiling  → builds risk profile from user input
+  macro_analysis           → runs all 5 sub-agents (industry, financial,
+                             cash flow, geopolitical, market)
 
-Intent routing table (handled by Claude via intent_parser.py):
-  "check_user_balance"   → check_user_balance
-  "check_agent_balance"  → check_agent_balance
-  "transfer_to_agent"    → transfer_to_agent
-  "create_wallet"        → create_wallet
-  "analyze_market"       → analyze_market
-  "suggest_trades"       → suggest_trades
-  "token_info"           → token_info
-  "market_status"        → market_status
-  "verify_rwa"           → verify_rwa
-  anything else          → handle_unknown
+Future nodes (not yet implemented):
+  match_asset              → matches profile + macro to specific assets
+  asset_class_analysis     → deep-dive into selected asset classes
+  asset_analysis           → individual asset evaluation
 """
 
 import logging
+import json
 from langgraph.graph import StateGraph, END
 
 from state import AgentState
-from intent_parser import parse_intent
-from wallet_tools import (
-    check_user_balance,
-    check_agent_balance,
-    transfer_to_agent,
-    create_wallet,
-)
+from agents.macro_analysis import run_macro_analysis
 
 logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Fallback Handler
+# Node: Customer Risk Profiling (placeholder — already built by team)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def handle_unknown(state: AgentState) -> dict:
-    return {
-        "result": (
-            "I didn't understand that. Here's what I can do:\n\n"
-            "**Wallet Operations:**\n"
-            "• Check your wallet balance\n"
-            "• Check the agent wallet balance\n"
-            "• Transfer ETH to the agent wallet\n"
-            "• Create a new Ethereum wallet\n\n"
-            "**Trading Intelligence:**\n"
-            "• Analyze the market for a target ROI (e.g. 'I want 20% ROI in 1 year')\n"
-            "• Suggest trades with gas + slippage protection\n"
-            "• Get info on a specific token (e.g. 'tell me about ONDO')\n"
-            "• Get current market status (Fear & Greed, top movers)\n"
-            "• Verify a RWA token's trust score (e.g. 'verify ondo-finance')\n"
-        )
+def customer_risk_profiling(state: AgentState) -> dict:
+    """
+    Build a customer risk profile from user input.
+
+    In production, this would:
+    - Parse user's investment goals, risk appetite, budget, etc.
+    - Use LLM to classify risk tolerance
+    - Pull KYC/jurisdiction data
+
+    For now, returns a default moderate profile that downstream agents can use.
+    """
+    user_input = state.get("user_input", "")
+
+    # Simple heuristic extraction (replace with LLM-based parsing)
+    profile = {
+        "risk_tolerance": "moderate",
+        "investment_horizon": "medium",
+        "target_roi_pct": 15.0,
+        "budget_usd": 10000.0,
+        "preferred_asset_types": ["RWA", "TokenizedTreasury"],
+        "jurisdiction": "US",
+        "kyc_status": "verified",
     }
 
+    # Basic keyword detection for risk tolerance
+    lower_input = user_input.lower()
+    if any(w in lower_input for w in ["conservative", "safe", "low risk", "stable"]):
+        profile["risk_tolerance"] = "conservative"
+        profile["target_roi_pct"] = 8.0
+    elif any(w in lower_input for w in ["aggressive", "high risk", "maximum", "growth"]):
+        profile["risk_tolerance"] = "aggressive"
+        profile["target_roi_pct"] = 25.0
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# NEW: Trading Intelligence Nodes
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def analyze_market(state: AgentState) -> dict:
-    """
-    Full market analysis with ROI target + portfolio allocation.
-    Triggered by: 'I want 20% ROI', 'analyze market', 'best tokens to buy'
-    """
-    try:
-        from trading_analyzer import analyze_all_tokens, format_analysis_for_chat
-        from data_pipeline import get_data_freshness
-
-        # Extract ROI target from user input (default 20%)
-        roi_target = _extract_roi(state.get("user_input", ""), default=20.0)
-        budget     = _extract_budget(state.get("amount", ""), default=1000.0)
-
-        # Check data freshness — warn if stale
-        freshness = get_data_freshness()
-        stale_warning = ""
-        if not freshness["is_fresh"]:
-            stale_warning = (
-                f"\n\n⚠️ *Market data is {freshness['age_minutes']:.0f} minutes old — "
-                "refreshing in background.*"
-            )
-
-        # Run analysis
-        report = analyze_all_tokens(
-            roi_target_pct=roi_target,
-            budget_usd=budget,
-            top_n=8,
-        )
-        result = format_analysis_for_chat(report) + stale_warning
-        return {"result": result}
-
-    except Exception as e:
-        logger.error("[agent] analyze_market error: %s", e, exc_info=True)
-        return {"result": f"Analysis error: {e}. Please try again."}
-
-
-def suggest_trades(state: AgentState) -> dict:
-    """
-    Build a complete gas/slippage-aware trade execution plan.
-    Triggered by: 'suggest trades', 'how should I trade', 'execute strategy'
-    """
-    try:
-        from trading_strategy import get_full_trading_plan, format_plan_for_chat
-
-        roi_target = _extract_roi(state.get("user_input", ""), default=20.0)
-        budget     = _extract_budget(state.get("amount", ""), default=1000.0)
-
-        plan = get_full_trading_plan(
-            roi_target_pct=roi_target,
-            budget_usd=budget,
-        )
-        result = format_plan_for_chat(plan)
-        return {"result": result}
-
-    except Exception as e:
-        logger.error("[agent] suggest_trades error: %s", e, exc_info=True)
-        return {"result": f"Strategy error: {e}. Please try again."}
-
-
-def token_info(state: AgentState) -> dict:
-    """
-    Deep analysis of a single token.
-    Triggered by: 'tell me about ONDO', 'analyze ETH', 'what is LINK doing'
-    """
-    try:
-        from trading_analyzer import analyze_token
-
-        # Extract token from user input
-        token_id = _extract_token_id(state.get("user_input", ""),
-                                      state.get("token_id", ""))
-        if not token_id:
-            return {
-                "result": (
-                    "Which token would you like me to analyze? "
-                    "For example: 'analyze ondo-finance' or 'tell me about ETH'"
-                )
-            }
-
-        analysis = analyze_token(token_id)
-        if not analysis:
-            return {"result": f"Token '{token_id}' not found in database. "
-                              "Try using the CoinGecko ID (e.g. 'ondo-finance', 'ethereum')."}
-
-        lines = [
-            f"## {analysis['symbol']} — {analysis['name']}",
-            f"",
-            f"**Price:** ${analysis['current_price']:.4f}  |  "
-            f"**Market Cap:** ${analysis['market_cap']/1e6:.0f}M",
-        ]
-        if analysis.get("tvl_usd"):
-            lines.append(f"**TVL:** ${analysis['tvl_usd']/1e6:.0f}M")
-        if analysis.get("apy_pct"):
-            lines.append(f"**APY:** {analysis['apy_pct']}% (RWA yield)")
-        lines.append("")
-        lines.append("### Technical Signals")
-        for sig in analysis["signal_summary"]:
-            lines.append(f"• {sig}")
-        lines.append("")
-        lines.append(f"### ROI Projection (12 months)")
-        lines.append(f"**Projected ROI:** {analysis['projected_roi_pct']:+.1f}%")
-        lines.append(
-            f"**Price Target:** ${analysis['price_target_12m']:.4f} "
-            f"({'✅ Hits 20% target' if analysis['hits_roi_target'] else '⚠️ Below 20% target'})"
-        )
-        bd = analysis["roi_breakdown"]
-        lines.append(f"• Momentum: {bd.get('momentum', 0):+.1f}%")
-        if bd.get("apy"):
-            lines.append(f"• APY yield: +{bd['apy']:.1f}%")
-        if bd.get("tvl_bonus"):
-            lines.append(f"• TVL bonus: +{bd['tvl_bonus']:.1f}%")
-        if bd.get("mean_reversion"):
-            lines.append(f"• Mean reversion: +{bd['mean_reversion']:.1f}%")
-        lines.append("")
-        lines.append(f"### Risk Assessment")
-        lines.append(f"**Risk:** {analysis['risk_label']} ({analysis['risk_score']:.0f}/100)")
-        lines.append(f"**Trust Score:** {analysis['trust_score']}/100")
-        lines.append(f"**Sentiment:** Fear&Greed={analysis['fear_greed_value']}/100")
-        lines.append("")
-        reco_emoji = {
-            "BUY": "✅", "ACCUMULATE": "📈", "WATCH": "👀",
-            "HOLD": "⏸", "AVOID": "❌"
-        }.get(analysis["recommendation"], "❓")
-        lines.append(
-            f"### {reco_emoji} Recommendation: {analysis['recommendation']}"
-        )
-        lines.append(analysis["recommendation_reason"])
-
-        return {"result": "\n".join(lines)}
-
-    except Exception as e:
-        logger.error("[agent] token_info error: %s", e, exc_info=True)
-        return {"result": f"Token analysis error: {e}"}
-
-
-def market_status(state: AgentState) -> dict:
-    """
-    Quick market overview: Fear & Greed, top movers, sentiment.
-    Triggered by: 'market status', 'how is the market', 'what's happening'
-    """
-    try:
-        from data_pipeline import (
-            get_all_tokens, get_latest_sentiment,
-            get_all_sentiment_summary, get_data_freshness
-        )
-
-        tokens    = get_all_tokens()
-        fg_row    = get_latest_sentiment("fear_greed", "MARKET")
-        fg_details = fg_row.get("details_json", {}) if fg_row else {}
-        fg_value  = fg_details.get("value", 50) if isinstance(fg_details, dict) else 50
-        fg_label  = fg_row.get("label", "UNKNOWN") if fg_row else "UNKNOWN"
-        freshness = get_data_freshness()
-
-        # Fear & Greed emoji
-        if fg_value >= 75:
-            fg_emoji = "🟢 EXTREME GREED"
-        elif fg_value >= 55:
-            fg_emoji = "🟡 GREED"
-        elif fg_value >= 45:
-            fg_emoji = "⚪ NEUTRAL"
-        elif fg_value >= 25:
-            fg_emoji = "🟠 FEAR"
-        else:
-            fg_emoji = "🔴 EXTREME FEAR"
-
-        lines = [
-            f"## Market Status",
-            f"",
-            f"**Fear & Greed Index:** {fg_value}/100 — {fg_emoji}",
-            f"**Data freshness:** {freshness['age_minutes']:.0f} min ago",
-            f"",
-        ]
-
-        # Top gainers 24h
-        with_change = [t for t in tokens if t.get("change_24h") is not None]
-        gainers = sorted(with_change, key=lambda x: x["change_24h"], reverse=True)[:5]
-        losers  = sorted(with_change, key=lambda x: x["change_24h"])[:3]
-
-        lines.append("### Top Gainers (24h)")
-        for t in gainers:
-            lines.append(
-                f"• **{t['symbol']}** {t['change_24h']:+.1f}%  "
-                f"@ ${t['price_usd']:.4f}"
-            )
-        lines.append("")
-        lines.append("### Top Losers (24h)")
-        for t in losers:
-            lines.append(
-                f"• **{t['symbol']}** {t['change_24h']:+.1f}%  "
-                f"@ ${t['price_usd']:.4f}"
-            )
-        lines.append("")
-
-        # Sentiment sources
-        sent = get_all_sentiment_summary()
-        if sent:
-            lines.append("### Sentiment Sources")
-            for src, val in sent.items():
-                icon = "🟢" if val["score"] > 0.6 else "🔴" if val["score"] < 0.4 else "⚪"
-                lines.append(
-                    f"• {icon} **{src.replace('_',' ').title()}**: "
-                    f"{val['label']} ({val['score']:.2f})"
-                )
-
-        return {"result": "\n".join(lines)}
-
-    except Exception as e:
-        logger.error("[agent] market_status error: %s", e, exc_info=True)
-        return {"result": f"Market status error: {e}"}
-
-
-def verify_rwa(state: AgentState) -> dict:
-    """
-    Run full 5-check verification on a RWA token.
-    Triggered by: 'verify ONDO', 'is ondo-finance legit', 'trust score for maple'
-    """
-    try:
-        from verification_layer import verify_rwa_asset, get_trust_badge_emoji
-
-        token_id = _extract_token_id(state.get("user_input", ""),
-                                      state.get("token_id", ""))
-        if not token_id:
-            return {
-                "result": (
-                    "Which RWA token would you like me to verify? "
-                    "Available: ondo-finance, centrifuge, maple, goldfinch, clearpool"
-                )
-            }
-
-        report = verify_rwa_asset(token_id)
-
-        if "error" in report:
-            return {"result": f"Verification error: {report['error']}"}
-
-        lines = [
-            f"## RWA Trust Verification: {report['symbol']}",
-            f"",
-            f"**Trust Score:** {report['trust_score']}/100 — "
-            f"{get_trust_badge_emoji(report['trust_score'])}",
-            f"**Underlying:** {report['underlying']}",
-            f"**Expected APY:** {report['expected_apy']}%",
-            f"",
-            f"### Score Breakdown",
-        ]
-        for check, vals in report["score_breakdown"].items():
-            bar = "#" * vals["score"] + "." * (vals["max"] - vals["score"])
-            lines.append(
-                f"• **{check.replace('_',' ').title()}:** "
-                f"[{bar}] {vals['score']}/{vals['max']}"
-            )
-        lines.append("")
-        if report["proof_points"]:
-            lines.append("### Proof Points")
-            for p in report["proof_points"]:
-                lines.append(f"✅ {p}")
-            lines.append("")
-        if report["risk_factors"]:
-            lines.append("### Risk Factors")
-            for r in report["risk_factors"][:5]:
-                lines.append(f"⚠️ {r}")
-
-        return {"result": "\n".join(lines)}
-
-    except Exception as e:
-        logger.error("[agent] verify_rwa error: %s", e, exc_info=True)
-        return {"result": f"Verification error: {e}"}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Routing Helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _extract_roi(text: str, default: float = 20.0) -> float:
-    """Extract ROI percentage from user message."""
+    # Budget extraction
     import re
-    matches = re.findall(r'(\d+(?:\.\d+)?)\s*%', text)
-    if matches:
-        return float(matches[0])
-    return default
-
-
-def _extract_budget(amount_str: str, default: float = 1000.0) -> float:
-    """Extract budget from amount field or text."""
-    import re
-    if amount_str:
+    budget_match = re.search(r'\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|usd|USD)?', user_input)
+    if budget_match:
         try:
-            return float(amount_str)
+            budget_str = budget_match.group(1).replace(",", "")
+            budget = float(budget_str)
+            if budget < 100:
+                budget *= 1000  # assume "k"
+            profile["budget_usd"] = budget
         except ValueError:
             pass
-    return default
 
+    logger.info(
+        "[RiskProfiling] Tolerance=%s | ROI=%.0f%% | Budget=$%.0f",
+        profile["risk_tolerance"], profile["target_roi_pct"], profile["budget_usd"],
+    )
 
-def _extract_token_id(text: str, hint: str = "") -> str:
-    """
-    Extract CoinGecko token ID from user message.
-    Maps common names/symbols → CoinGecko IDs.
-    """
-    if hint:
-        return hint.lower()
-
-    text_lower = text.lower()
-
-    # Symbol → CoinGecko ID map
-    symbol_map = {
-        "btc":     "bitcoin",        "bitcoin":  "bitcoin",
-        "eth":     "ethereum",       "ethereum": "ethereum",
-        "link":    "chainlink",      "chainlink":"chainlink",
-        "aave":    "aave",
-        "uni":     "uniswap",        "uniswap":  "uniswap",
-        "mkr":     "maker",          "maker":    "maker",
-        "crv":     "curve-dao-token","curve":    "curve-dao-token",
-        "ldo":     "lido-dao",       "lido":     "lido-dao",
-        "arb":     "arbitrum",       "arbitrum": "arbitrum",
-        "op":      "optimism",       "optimism": "optimism",
-        "ondo":    "ondo-finance",   "ondo-finance": "ondo-finance",
-        "cfg":     "centrifuge",     "centrifuge":"centrifuge",
-        "mpl":     "maple",          "maple":    "maple",
-        "gfi":     "goldfinch",      "goldfinch":"goldfinch",
-        "cpool":   "clearpool",      "clearpool":"clearpool",
-        "pendle":  "pendle",
-        "gmx":     "gmx",
-        "gns":     "gains-network",
-    }
-
-    for kw, cg_id in symbol_map.items():
-        if kw in text_lower:
-            return cg_id
-
-    return ""
+    return {"customer_risk_profile": profile}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Router
+# Node: Macro Analysis (orchestrates 5 sub-agents)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def route_by_intent(state: AgentState) -> str:
-    routing = {
-        # Wallet ops (original)
-        "check_user_balance":  "check_user_balance",
-        "check_agent_balance": "check_agent_balance",
-        "transfer_to_agent":   "transfer_to_agent",
-        "create_wallet":       "create_wallet",
-        # Trading intelligence (new)
-        "analyze_market":      "analyze_market",
-        "suggest_trades":      "suggest_trades",
-        "token_info":          "token_info",
-        "market_status":       "market_status",
-        "verify_rwa":          "verify_rwa",
-    }
-    return routing.get(state.get("intent", "unknown"), "handle_unknown")
+def macro_analysis(state: AgentState) -> dict:
+    """
+    Run the Macro Analysis Agent which orchestrates:
+    - Industry Analysis Agent
+    - Financial Analysis Agent
+    - Cash Flow Agent
+    - Geopolitical Analysis Agent
+    - Market Analysis Agent
+
+    Takes customer_risk_profile from previous node and produces
+    a comprehensive macro_analysis_report.
+    """
+    profile = state.get("customer_risk_profile", {})
+
+    try:
+        report = run_macro_analysis(customer_risk_profile=profile)
+
+        # Format summary for chat output
+        summary = report.get("summary", "Macro analysis complete.")
+        score = report.get("overall_macro_score", 0)
+        assets = report.get("recommended_asset_types", [])
+
+        result_text = (
+            f"## Macro Analysis Report\n\n"
+            f"**Overall Macro Score:** {score}/100\n\n"
+            f"{summary}\n\n"
+            f"**Recommended Asset Types:** {', '.join(assets) if assets else 'N/A'}\n\n"
+            f"*{report.get('agents_completed', '0/5')} sub-agents completed successfully*"
+        )
+
+        return {
+            "macro_analysis_report": report,
+            "industry_analysis": report.get("industry_analysis"),
+            "financial_analysis": report.get("financial_analysis"),
+            "cash_flow_analysis": report.get("cash_flow_analysis"),
+            "geopolitical_analysis": report.get("geopolitical_analysis"),
+            "market_analysis": report.get("market_analysis"),
+            "result": result_text,
+        }
+
+    except Exception as e:
+        logger.error("[MacroNode] Error: %s", e, exc_info=True)
+        return {
+            "macro_analysis_report": {"error": str(e)},
+            "result": f"Macro analysis error: {e}",
+            "error": str(e),
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -427,47 +142,27 @@ def route_by_intent(state: AgentState) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_graph():
+    """
+    Build and compile the LangGraph state machine.
+
+    Current flow:
+      customer_risk_profiling → macro_analysis → END
+
+    Future flow (when more agents are added):
+      customer_risk_profiling → macro_analysis → match_asset
+        → asset_class_analysis → asset_analysis → END
+    """
     graph = StateGraph(AgentState)
 
-    # Core nodes
-    graph.add_node("parse_intent",        parse_intent)
+    # ── Add nodes ───────────────────────────────────────────────────────
+    graph.add_node("customer_risk_profiling", customer_risk_profiling)
+    graph.add_node("macro_analysis", macro_analysis)
 
-    # Wallet nodes (original)
-    graph.add_node("check_user_balance",  check_user_balance)
-    graph.add_node("check_agent_balance", check_agent_balance)
-    graph.add_node("transfer_to_agent",   transfer_to_agent)
-    graph.add_node("create_wallet",       create_wallet)
+    # ── Set entry point ─────────────────────────────────────────────────
+    graph.set_entry_point("customer_risk_profiling")
 
-    # Trading intelligence nodes (new)
-    graph.add_node("analyze_market",      analyze_market)
-    graph.add_node("suggest_trades",      suggest_trades)
-    graph.add_node("token_info",          token_info)
-    graph.add_node("market_status",       market_status)
-    graph.add_node("verify_rwa",          verify_rwa)
-
-    # Fallback
-    graph.add_node("handle_unknown",      handle_unknown)
-
-    # Entry point
-    graph.set_entry_point("parse_intent")
-
-    # All routing destinations
-    all_nodes = {
-        "check_user_balance":  "check_user_balance",
-        "check_agent_balance": "check_agent_balance",
-        "transfer_to_agent":   "transfer_to_agent",
-        "create_wallet":       "create_wallet",
-        "analyze_market":      "analyze_market",
-        "suggest_trades":      "suggest_trades",
-        "token_info":          "token_info",
-        "market_status":       "market_status",
-        "verify_rwa":          "verify_rwa",
-        "handle_unknown":      "handle_unknown",
-    }
-    graph.add_conditional_edges("parse_intent", route_by_intent, all_nodes)
-
-    # All nodes → END
-    for node_name in all_nodes:
-        graph.add_edge(node_name, END)
+    # ── Define edges ────────────────────────────────────────────────────
+    graph.add_edge("customer_risk_profiling", "macro_analysis")
+    graph.add_edge("macro_analysis", END)
 
     return graph.compile()
