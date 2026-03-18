@@ -62,7 +62,7 @@ def _classify_rate_environment(treasury_yields: Dict, macro: Dict) -> Dict[str, 
         rate_source = "world_bank_real_rate"
 
     if rate >= 4.5:
-        env = "HIGH"
+        env = "HIGH" # Very high rates (e.g. 1980s) — extremely favorable for treasury RWAs
     elif rate >= 2.0:
         env = "MODERATE"
     else:
