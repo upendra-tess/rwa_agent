@@ -25,7 +25,7 @@ class BedrockClient:
     """
 
     def __init__(self):
-        self.model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-opus-4-6-v1:1m")
+        self.model_id = os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6-20251001-v1:0")
         self.region = os.getenv("AWS_REGION", "us-east-1")
 
         session = boto3.Session(
@@ -35,7 +35,7 @@ class BedrockClient:
         )
         self.client = session.client(
             "bedrock-runtime",
-            config=Config(read_timeout=60, connect_timeout=10),
+            config=Config(read_timeout=600, connect_timeout=10),
         )
 
     def send_message(self, user_message: str, system_prompt: str = None) -> str:

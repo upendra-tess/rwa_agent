@@ -10,6 +10,8 @@ Sources: Chicago Fed NFCI, FRED, IMF API, World Bank, ECB,
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from agents.utils import extract_json
 
 from bedrock_client import BedrockClient
 from state import MultiAgentState
@@ -34,6 +36,8 @@ Given financial conditions data, produce a structured analysis covering:
 5. RWA_MARKET_STRUCTURE: TVL distribution, holder concentration, activity depth
 6. FUNDING_ENVIRONMENT: How easy it is to deploy capital into RWA
 
+IMPORTANT: Keep ALL text fields under 25 words. Be concise.
+
 Return ONLY valid JSON:
 {
   "financial_conditions": {"nfci_value": <float|null>, "assessment": "<TIGHT|NEUTRAL|LOOSE>", "summary": "<string>"},
@@ -53,15 +57,25 @@ def financial_analysis_agent(state: MultiAgentState) -> dict:
     macro = state.get("macro_context", {})
     rwa_universe = state.get("rwa_universe", [])
 
-    # Fetch financial data
-    nfci = fetch_chicago_fed_nfci()
-    fed_funds = fetch_fred_latest("FEDFUNDS")
-    baa_spread = fetch_fred_latest("BAAFFM")  # Baa corporate bond spread
-    ted_spread = fetch_fred_latest("TEDRATE")  # TED spread
-    stablecoins = fetch_defillama_stablecoins()
-    defi_yields = fetch_defillama_yields("stablecoin")
-    protocols = fetch_defillama_protocols(30)
-    ecb = fetch_ecb_rates()
+    # Fetch financial data in parallel
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        f_nfci = pool.submit(fetch_chicago_fed_nfci)
+        f_fed = pool.submit(fetch_fred_latest, "FEDFUNDS")
+        f_baa = pool.submit(fetch_fred_latest, "BAAFFM")
+        f_ted = pool.submit(fetch_fred_latest, "TEDRATE")
+        f_stables = pool.submit(fetch_defillama_stablecoins)
+        f_yields = pool.submit(fetch_defillama_yields, "stablecoin")
+        f_protocols = pool.submit(fetch_defillama_protocols, 30)
+        f_ecb = pool.submit(fetch_ecb_rates)
+
+    nfci = f_nfci.result()
+    fed_funds = f_fed.result()
+    baa_spread = f_baa.result()
+    ted_spread = f_ted.result()
+    stablecoins = f_stables.result()
+    defi_yields = f_yields.result()
+    protocols = f_protocols.result()
+    ecb = f_ecb.result()
 
     # Aggregate RWA universe stats
     total_rwa_tvl = sum(a["tvl"] for a in rwa_universe)
@@ -86,13 +100,12 @@ def financial_analysis_agent(state: MultiAgentState) -> dict:
             "top_stablecoins": stablecoins.get("top_stablecoins", [])[:5],
         },
         "defi_yields": [
-            {"protocol": y["project"], "symbol": y["symbol"],
-             "apy": y["apy"], "tvl": y["tvl"]}
-            for y in defi_yields[:15]
+            {"protocol": y["project"], "apy": y["apy"], "tvl": y["tvl"]}
+            for y in defi_yields[:8]
         ],
         "top_protocols_by_tvl": [
             {"name": p["name"], "tvl": p["tvl"], "category": p["category"]}
-            for p in protocols[:15]
+            for p in protocols[:5]
         ],
         "rwa_market": {
             "total_tvl": total_rwa_tvl,
@@ -100,29 +113,22 @@ def financial_analysis_agent(state: MultiAgentState) -> dict:
             "by_asset_type": by_type,
             "top_protocols": [
                 {"name": a["name"], "tvl": a["tvl"], "asset_type": a["asset_type"]}
-                for a in rwa_universe[:15]
+                for a in rwa_universe[:8]
             ],
         },
     }
 
     prompt = (
         "Analyze the financial conditions for RWA investment based on this data:\n\n"
-        f"{json.dumps(data_context, indent=2, default=str)}"
+        f"{json.dumps(data_context, default=str)}"
     )
 
-    raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
-
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
+    logger.info("[financial_analysis] Sending to LLM for analysis...")
     try:
-        analysis = json.loads(text)
-    except json.JSONDecodeError:
+        raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
+        logger.info("[financial_analysis] LLM response received, parsing...")
+        analysis = extract_json(raw)
+    except Exception as e:
         logger.warning("[financial_analysis] Failed to parse LLM response")
         analysis = {
             "overall_score": 50,

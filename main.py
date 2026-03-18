@@ -20,6 +20,7 @@ import logging
 import sys
 
 from agent_graph import build_graph
+from agents.conversational_profiler import ConversationalProfiler
 
 # Configure logging
 logging.basicConfig(
@@ -30,48 +31,67 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def main():
-    """Launch the interactive multi-agent CLI."""
-    print("\n" + "=" * 60)
-    print("   RWA Multi-Agent Investment Advisor")
-    print("=" * 60)
-    print()
-    print("Describe your investment goals. I'll analyze the market")
-    print("across 10 specialized agents and recommend a portfolio.")
-    print()
-    print("Example prompts:")
-    print("  - I have $25,000, US-based, want 15% returns in 1 year")
-    print("  - Conservative investor, $100k budget, EU region,")
-    print("    need monthly liquidity, targeting 8% yield")
-    print("  - Aggressive crypto-native, $5k, 2-year horizon,")
-    print("    willing to lock funds for higher yield")
-    print()
-    print('Type "quit" or "exit" to stop.')
-    print()
+def run_conversation() -> dict:
+    """Run the conversational profiler and return the completed profile."""
+    profiler = ConversationalProfiler()
 
-    agent = build_graph()
+    # Opening question
+    opening = profiler.start()
+    print(f"\nAnalyst: {opening}\n")
 
     while True:
         try:
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye!")
-            break
+            sys.exit(0)
 
         if user_input.lower() in ("quit", "exit", "q"):
             print("Goodbye!")
-            break
+            sys.exit(0)
 
         if not user_input:
             continue
 
-        print("\nRunning multi-agent analysis pipeline...")
-        print("  [1/4] Customer profiling + fetching RWA universe...")
+        message, complete = profiler.respond(user_input)
+        print(f"\nAnalyst: {message}\n")
 
+        if complete:
+            break
+
+    return profiler.get_profile()
+
+
+def main():
+    """Launch the interactive multi-agent CLI."""
+    print("\n" + "=" * 60)
+    print("   RWA Multi-Agent Asset Analyzer")
+    print("=" * 60)
+    print()
+    print('Type "quit" or "exit" at any time to stop.')
+    print()
+
+    agent = build_graph()
+
+    while True:
+        # Step 1: Conversational profiling
+        profile = run_conversation()
+        profile["_from_conversation"] = True
+
+        logger.info(
+            "Profile collected: budget=$%.0f region=%s risk=%s horizon=%dmo return=%.1f%%",
+            profile["budget"], profile["region"], profile["risk_tolerance"],
+            profile["time_horizon_months"], profile["expected_return_pct"],
+        )
+
+        print("\nRunning market analysis across 10 specialized agents...")
+        print("  Watch the log timestamps for progress.\n")
+
+        # Step 2: Run the pipeline with the pre-built profile
         initial_state = {
-            "user_input": user_input,
+            "user_input": "",
             "rwa_universe": [],
-            "customer_profile": {},
+            "customer_profile": profile,
             "macro_context": {},
             "industry_analysis": {},
             "financial_analysis": {},
@@ -87,11 +107,23 @@ def main():
         try:
             final_state = agent.invoke(initial_state)
             result = final_state.get("result", "No result generated.")
-            print(f"\nAgent:\n{result}\n")
+            print(f"\n{result}\n")
         except Exception as e:
             logger.error("Pipeline error: %s", e, exc_info=True)
             print(f"\nError during analysis: {e}")
-            print("Please try again with a different query.\n")
+            print("Please try again.\n")
+
+        # Ask if user wants another analysis
+        print("-" * 60)
+        try:
+            again = input("Run another analysis? (yes/no): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
+        if again not in ("yes", "y"):
+            print("Goodbye!")
+            break
+        print()
 
 
 if __name__ == "__main__":

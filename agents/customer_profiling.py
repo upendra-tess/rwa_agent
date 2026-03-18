@@ -15,6 +15,7 @@ Parameters extracted:
 
 import json
 import logging
+from agents.utils import extract_json
 
 from bedrock_client import BedrockClient
 from state import MultiAgentState
@@ -49,52 +50,49 @@ Return ONLY valid JSON (no markdown, no explanation):
 
 
 def customer_profiling_agent(state: MultiAgentState) -> dict:
-    """Extract customer profile from user input using LLM."""
-    user_input = state.get("user_input", "")
-    logger.info("[customer_profiling] Processing: %s", user_input[:100])
+    """Extract customer profile from user input using LLM, or use pre-built profile from conversation."""
+    # If profile was already built via conversational profiler, skip LLM parsing
+    existing_profile = state.get("customer_profile", {})
+    if existing_profile.get("_from_conversation"):
+        profile = existing_profile
+        logger.info("[customer_profiling] Using conversational profile: %s", profile)
+    else:
+        user_input = state.get("user_input", "")
+        logger.info("[customer_profiling] Processing: %s", user_input[:100])
 
-    prompt = f"Extract the customer investment profile from this message:\n\n\"{user_input}\""
-    raw = bedrock.send_message(prompt, system_prompt=PROFILE_SYSTEM_PROMPT)
+        prompt = f"Extract the customer investment profile from this message:\n\n\"{user_input}\""
+        raw = bedrock.send_message(prompt, system_prompt=PROFILE_SYSTEM_PROMPT)
 
-    # Parse JSON response
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
+        try:
+            profile = extract_json(raw)
+        except Exception as e:
+            logger.warning("[customer_profiling] Failed to parse: %s", raw[:200])
+            profile = {}
 
-    try:
-        profile = json.loads(text)
-    except json.JSONDecodeError:
-        logger.warning("[customer_profiling] Failed to parse: %s", text[:200])
-        profile = {}
+        # Apply defaults for missing fields
+        defaults = {
+            "budget": 10000.0,
+            "region": "US",
+            "time_horizon_months": 12,
+            "expected_return_pct": 10.0,
+            "redemption_window": "monthly",
+            "risk_tolerance": "moderate",
+        }
+        for key, default in defaults.items():
+            if key not in profile or profile[key] is None:
+                profile[key] = default
 
-    # Apply defaults for missing fields
-    defaults = {
-        "budget": 10000.0,
-        "region": "US",
-        "time_horizon_months": 12,
-        "expected_return_pct": 10.0,
-        "redemption_window": "monthly",
-        "risk_tolerance": "moderate",
-    }
-    for key, default in defaults.items():
-        if key not in profile or profile[key] is None:
-            profile[key] = default
-
-    # Ensure correct types
-    profile["budget"] = float(profile["budget"])
-    profile["time_horizon_months"] = int(profile["time_horizon_months"])
-    profile["expected_return_pct"] = float(profile["expected_return_pct"])
+        # Ensure correct types
+        profile["budget"] = float(profile["budget"])
+        profile["time_horizon_months"] = int(profile["time_horizon_months"])
+        profile["expected_return_pct"] = float(profile["expected_return_pct"])
 
     logger.info(
         "[customer_profiling] Profile: budget=$%.0f region=%s horizon=%dmo "
         "return=%.1f%% redemption=%s risk=%s",
-        profile["budget"], profile["region"], profile["time_horizon_months"],
-        profile["expected_return_pct"], profile["redemption_window"],
-        profile["risk_tolerance"],
+        profile.get("budget", 0), profile.get("region", "?"),
+        profile.get("time_horizon_months", 0), profile.get("expected_return_pct", 0),
+        profile.get("redemption_window", "?"), profile.get("risk_tolerance", "?"),
     )
 
     # Fetch the live RWA universe (single source of truth for all downstream agents)

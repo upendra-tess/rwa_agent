@@ -10,6 +10,8 @@ Sources: FRED, IMF API, World Bank, UN Comtrade,
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from agents.utils import extract_json
 
 from bedrock_client import BedrockClient
 from state import MultiAgentState
@@ -34,6 +36,8 @@ Given discount-rate data, trade flows, yield competition, and issuer disclosures
 5. ISSUER_ASSESSMENT: Quality assessment of RWA issuers based on disclosures
 6. CASH_FLOW_RISKS: Key risks to RWA cash flow sustainability
 
+IMPORTANT: Keep ALL text fields under 25 words. Be concise.
+
 Return ONLY valid JSON:
 {
   "discount_rate_analysis": {"risk_free_rate": <float>, "implied_spread": <float>, "summary": "<string>"},
@@ -53,18 +57,24 @@ def cashflow_analysis_agent(state: MultiAgentState) -> dict:
     macro = state.get("macro_context", {})
     rwa_universe = state.get("rwa_universe", [])
 
-    # Fetch cash flow relevant data
-    yields = fetch_treasury_yields()
-    fed_funds = fetch_fred_latest("FEDFUNDS")
-    real_rate = fetch_fred_latest("DFII10")  # 10Y TIPS real yield
-    trade = fetch_un_comtrade()
-
-    defi_yields = fetch_defillama_yields()
-    protocols = fetch_defillama_protocols(30)
-
-    # Get CoinGecko prices for top RWA tokens with gecko_ids
+    # Fetch cash flow relevant data in parallel
     gecko_ids = [a["gecko_id"] for a in rwa_universe if a.get("gecko_id")][:15]
-    rwa_tokens = fetch_coingecko_market(gecko_ids) if gecko_ids else []
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        f_yields = pool.submit(fetch_treasury_yields)
+        f_fed = pool.submit(fetch_fred_latest, "FEDFUNDS")
+        f_real = pool.submit(fetch_fred_latest, "DFII10")
+        f_trade = pool.submit(fetch_un_comtrade)
+        f_defi = pool.submit(fetch_defillama_yields)
+        f_protocols = pool.submit(fetch_defillama_protocols, 30)
+        f_tokens = pool.submit(fetch_coingecko_market, gecko_ids) if gecko_ids else None
+
+    yields = f_yields.result()
+    fed_funds = f_fed.result()
+    real_rate = f_real.result()
+    trade = f_trade.result()
+    defi_yields = f_defi.result()
+    protocols = f_protocols.result()
+    rwa_tokens = f_tokens.result() if f_tokens else []
 
     # Avg DeFi stablecoin yield
     stable_yields = [y["apy"] for y in defi_yields if y["apy"] and 0 < y["apy"] < 50]
@@ -94,40 +104,27 @@ def cashflow_analysis_agent(state: MultiAgentState) -> dict:
         "avg_rwa_yield": round(avg_rwa_yield, 2),
         "rwa_market_tvl": total_rwa_tvl,
         "rwa_universe_top": [
-            {"name": a["name"], "tvl": a["tvl"], "asset_type": a["asset_type"],
-             "chain": a["chain"]}
-            for a in rwa_universe[:15]
-        ],
-        "rwa_token_prices": [
-            {"symbol": t["symbol"], "market_cap": t["market_cap"],
-             "change_30d": t.get("change_30d")}
-            for t in rwa_tokens
+            {"name": a["name"], "tvl": a["tvl"], "asset_type": a["asset_type"]}
+            for a in rwa_universe[:8]
         ],
         "top_defi_yields": [
             {"protocol": y["project"], "apy": y["apy"], "tvl": y["tvl"]}
-            for y in defi_yields[:10]
+            for y in defi_yields[:8]
         ],
     }
 
     prompt = (
         "Analyze the cash flow dynamics for RWA investments based on this data:\n\n"
-        f"{json.dumps(data_context, indent=2, default=str)}"
+        f"{json.dumps(data_context, default=str)}"
     )
 
-    raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
-
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
+    logger.info("[cashflow_analysis] Sending to LLM for analysis...")
     try:
-        analysis = json.loads(text)
-    except json.JSONDecodeError:
-        logger.warning("[cashflow_analysis] Failed to parse LLM response")
+        raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
+        logger.info("[cashflow_analysis] LLM response received, parsing...")
+        analysis = extract_json(raw)
+    except Exception as e:
+        logger.warning("[cashflow_analysis] Failed to parse LLM response: %s", e)
         analysis = {
             "overall_score": 50,
             "overall_assessment": "ADEQUATE",
@@ -137,6 +134,18 @@ def cashflow_analysis_agent(state: MultiAgentState) -> dict:
             "issuer_assessment": [],
             "cashflow_risks": [],
         }
+
+    # Attach raw signals for qualitative context in output
+    analysis["_key_signals"] = {
+        "yield_3m": yields.get("yield_3m"),
+        "yield_10y": yields.get("yield_10y"),
+        "avg_defi_yield": avg_defi_yield,
+        "avg_rwa_yield": avg_rwa_yield,
+        "top_defi_yields": [
+            {"protocol": y["project"], "apy": y["apy"]}
+            for y in defi_yields[:5]
+        ],
+    }
 
     logger.info(
         "[cashflow_analysis] Done: score=%s assessment=%s",

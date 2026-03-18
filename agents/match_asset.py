@@ -10,6 +10,7 @@ then filters and ranks based on customer-specific constraints.
 
 import json
 import logging
+from agents.utils import extract_json
 
 from bedrock_client import BedrockClient
 from state import MultiAgentState
@@ -75,18 +76,8 @@ Return ONLY valid JSON - a list of matched assets sorted by match_score descendi
     "tvl": <float>,
     "chain": "<string>",
     "match_score": <0-100>,
-    "match_breakdown": {
-      "return_fit": <0-25>,
-      "risk_fit": <0-25>,
-      "redemption_fit": <0-15>,
-      "size_trust_fit": <0-15>,
-      "macro_fit": <0-10>,
-      "market_fit": <0-10>
-    },
-    "estimated_apy_range": "<string e.g. '4-6%'>",
-    "match_reason": "<string>",
-    "suggested_allocation_pct": <float>,
-    "warnings": [<strings>]
+    "match_reason": "<1-2 sentence summary>",
+    "warnings": ["<string>"]
   }
 ]"""
 
@@ -105,7 +96,7 @@ def match_asset_agent(state: MultiAgentState) -> dict:
     market = state.get("market_analysis", {})
 
     if not rwa_universe:
-        logger.warning("[match_asset] RWA universe is empty")
+        logger.error("[match_asset] RWA universe is empty — customer_profile=%s", customer)
         return {"matched_assets": []}
 
     # Build condensed analysis summary
@@ -132,20 +123,25 @@ def match_asset_agent(state: MultiAgentState) -> dict:
         },
     }
 
-    # Send top 40 RWA protocols to LLM for matching (avoid token overflow)
+    # Send top 25 RWA protocols to LLM for matching
     universe_for_llm = [
         {
             "slug": a["slug"], "name": a["name"], "symbol": a["symbol"],
-            "tvl": a["tvl"], "chain": a["chain"], "asset_type": a["asset_type"],
-            "audits": a.get("audits", 0), "chains": a.get("chains", []),
-            "change_7d": a.get("change_7d"),
-            "gecko_id": a.get("gecko_id", ""),
+            "tvl": round(a["tvl"]), "chain": a["chain"], "asset_type": a["asset_type"],
+            "audits": a.get("audits", 0), "change_7d": a.get("change_7d"),
         }
-        for a in rwa_universe[:40]
+        for a in rwa_universe[:25]
     ]
 
     data_context = {
-        "customer_profile": customer,
+        "customer_profile": {
+            "budget": customer.get("budget"),
+            "risk_tolerance": customer.get("risk_tolerance"),
+            "expected_return_pct": customer.get("expected_return_pct"),
+            "time_horizon_months": customer.get("time_horizon_months"),
+            "redemption_frequency": customer.get("redemption_frequency"),
+            "region": customer.get("region"),
+        },
         "macro_context": {
             "regime": macro.get("macro_regime", "UNKNOWN"),
             "rate_env": macro.get("rate_environment", "UNKNOWN"),
@@ -158,26 +154,38 @@ def match_asset_agent(state: MultiAgentState) -> dict:
 
     prompt = (
         "Match the best RWA assets for this customer from the live universe:\n\n"
-        f"{json.dumps(data_context, indent=2, default=str)}"
+        f"{json.dumps(data_context, default=str)}"
     )
 
-    raw = bedrock.send_message(prompt, system_prompt=MATCH_SYSTEM_PROMPT)
-
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
+    logger.info("[match_asset] Sending %d assets to LLM for ranking...", len(universe_for_llm))
 
     try:
-        matched = json.loads(text)
+        raw = bedrock.send_message(prompt, system_prompt=MATCH_SYSTEM_PROMPT)
+        logger.info("[match_asset] LLM response received, parsing...")
+        matched = extract_json(raw)
         if not isinstance(matched, list):
             matched = [matched]
-    except json.JSONDecodeError:
-        logger.warning("[match_asset] LLM parse failed, using rule-based fallback")
+    except Exception as e:
+        logger.warning("[match_asset] LLM call failed (%s), using rule-based fallback", e)
         matched = _rule_based_matching(rwa_universe, customer, macro)
+
+    # Last resort: if still empty, return top assets from universe unfiltered
+    if not matched and rwa_universe:
+        logger.warning("[match_asset] Rule-based fallback empty, using top universe assets")
+        matched = [
+            {
+                "slug": a.get("slug", ""),
+                "name": a.get("name", ""),
+                "symbol": a.get("symbol", ""),
+                "asset_type": a.get("asset_type", ""),
+                "tvl": a.get("tvl", 0),
+                "chain": a.get("chain", ""),
+                "match_score": 50,
+                "match_reason": "Fallback — top TVL asset",
+                "warnings": [],
+            }
+            for a in rwa_universe[:10]
+        ]
 
     matched.sort(key=lambda x: x.get("match_score", 0), reverse=True)
 
@@ -270,24 +278,9 @@ def _rule_based_matching(rwa_universe: list, customer: dict, macro: dict) -> lis
             "chain": asset.get("chain", ""),
             "gecko_id": asset.get("gecko_id", ""),
             "match_score": min(100, score),
-            "match_breakdown": {},
-            "estimated_apy_range": f"{est_apy:.0f}%",
             "match_reason": f"{asset.get('name')}: {asset_type}, TVL ${tvl/1e6:.0f}M",
-            "suggested_allocation_pct": 0,
             "warnings": [],
         })
 
     results.sort(key=lambda x: x["match_score"], reverse=True)
-
-    # Assign allocation to top picks
-    total_alloc = 0
-    for i, r in enumerate(results[:8]):
-        alloc = max(5, 30 - i * 5)
-        r["suggested_allocation_pct"] = alloc
-        total_alloc += alloc
-    if total_alloc > 0:
-        for r in results[:8]:
-            r["suggested_allocation_pct"] = round(
-                r["suggested_allocation_pct"] / total_alloc * 100, 1)
-
     return results[:15]

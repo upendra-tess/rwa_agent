@@ -8,17 +8,15 @@ Uses price history data to compute statistical relationships between
 asset pairs, helping optimize portfolio construction.
 """
 
-import json
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from bedrock_client import BedrockClient
 from state import MultiAgentState
 from data_sources import fetch_coingecko_price_history
 
 logger = logging.getLogger(__name__)
-bedrock = BedrockClient()
 
 
 def _compute_returns(prices: list) -> list:
@@ -66,30 +64,6 @@ def _compute_volatility(returns: list) -> float:
     return round(daily_vol * math.sqrt(365) * 100, 2)  # annualized %
 
 
-ANALYSIS_SYSTEM_PROMPT = """You are an Asset Class Analysis Agent specializing in portfolio optimization.
-
-Given correlation/R-squared data between matched RWA assets, produce a diversification analysis:
-
-1. CORRELATION_INSIGHTS: Which assets move together and which provide diversification
-2. ANTI_CORRELATIONS: Asset pairs with negative correlation (diversification opportunities)
-3. PORTFOLIO_CONSTRUCTION: How to weight assets for optimal diversification
-4. CONCENTRATION_RISKS: If portfolio is too concentrated in correlated assets
-5. RECOMMENDED_MIX: Optimal allocation percentages for diversification
-
-Return ONLY valid JSON:
-{
-  "correlation_insights": [{"pair": "<A-B>", "correlation": <float>, "interpretation": "<string>"}],
-  "anti_correlations": [{"pair": "<A-B>", "correlation": <float>, "benefit": "<string>"}],
-  "high_correlations": [{"pair": "<A-B>", "correlation": <float>, "warning": "<string>"}],
-  "diversification_score": <0-100>,
-  "diversification_assessment": "<WELL_DIVERSIFIED|MODERATE|CONCENTRATED>",
-  "concentration_risks": [<strings>],
-  "recommended_mix": [{"token_id": "<string>", "symbol": "<string>", "allocation_pct": <float>, "reason": "<string>"}],
-  "portfolio_metrics": {"expected_return": <float>, "expected_volatility": <float>, "sharpe_estimate": <float>},
-  "summary": "<string>"
-}"""
-
-
 def asset_class_analysis_agent(state: MultiAgentState) -> dict:
     """Perform cross-asset correlation analysis on matched assets."""
     logger.info("[asset_class_analysis] Starting...")
@@ -117,12 +91,14 @@ def asset_class_analysis_agent(state: MultiAgentState) -> dict:
             gecko_ids.append(gid)
             slug_to_gecko[slug] = gid
 
-    # Fetch price histories for assets with gecko_ids
+    # Fetch price histories in parallel
     price_histories = {}
     return_series = {}
     volatilities = {}
-    for gid in gecko_ids:
-        prices_raw = fetch_coingecko_price_history(gid, days=90)
+    with ThreadPoolExecutor(max_workers=len(gecko_ids) or 1) as pool:
+        futures = {gid: pool.submit(fetch_coingecko_price_history, gid, 90) for gid in gecko_ids}
+    for gid, fut in futures.items():
+        prices_raw = fut.result()
         if prices_raw:
             prices = [p[1] for p in prices_raw]
             price_histories[gid] = prices
@@ -163,75 +139,54 @@ def asset_class_analysis_agent(state: MultiAgentState) -> dict:
     else:
         div_score = 50
 
-    # Build context for LLM
-    data_context = {
-        "customer_profile": {
-            "risk_tolerance": customer.get("risk_tolerance", "moderate"),
-            "expected_return": customer.get("expected_return_pct", 10),
-            "time_horizon_months": customer.get("time_horizon_months", 12),
-        },
-        "matched_assets": [
-            {
-                "slug": a.get("slug"), "name": a.get("name"),
-                "symbol": a.get("symbol"), "asset_type": a.get("asset_type"),
-                "tvl": a.get("tvl"), "match_score": a.get("match_score"),
-                "estimated_apy_range": a.get("estimated_apy_range", ""),
-                "suggested_allocation": a.get("suggested_allocation_pct"),
-                "volatility_annual_pct": volatilities.get(a.get("gecko_id", ""), 0),
-            }
-            for a in top_assets
-        ],
-        "correlations": correlations,
-        "r_squared": r_squared_map,
+    # Rule-based diversification assessment
+    if div_score >= 65:
+        assessment = "WELL_DIVERSIFIED"
+    elif div_score >= 40:
+        assessment = "MODERATE"
+    else:
+        assessment = "CONCENTRATED"
+
+    # Identify concentration risks from asset types
+    type_counts: dict = {}
+    for a in top_assets:
+        t = a.get("asset_type", "other")
+        type_counts[t] = type_counts.get(t, 0) + 1
+    concentration_risks = [
+        f"High concentration in {t} ({n} assets)"
+        for t, n in type_counts.items() if n >= 3
+    ]
+    if high_correlations:
+        concentration_risks.append(f"{len(high_correlations)} asset pairs are highly correlated (>0.7)")
+
+    # Build recommended mix from match scores and volatilities
+    total_score = sum(a.get("match_score", 50) for a in top_assets) or 1
+    recommended_mix = [
+        {
+            "slug": a.get("slug"),
+            "symbol": a.get("symbol"),
+            "allocation_pct": round(a.get("match_score", 50) / total_score * 100, 1),
+        }
+        for a in top_assets
+    ]
+
+    analysis = {
+        "diversification_score": div_score,
+        "diversification_assessment": assessment,
         "anti_correlations": anti_correlations,
         "high_correlations": high_correlations,
-        "diversification_score": div_score,
-        "macro_regime": macro.get("macro_regime", "UNKNOWN"),
-        "risk_free_rate": macro.get("key_rates", {}).get("yield_3m", 4.0),
-    }
-
-    prompt = (
-        "Analyze the cross-asset correlations and recommend optimal portfolio diversification:\n\n"
-        f"{json.dumps(data_context, indent=2, default=str)}"
-    )
-
-    raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
-
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
-    try:
-        analysis = json.loads(text)
-    except json.JSONDecodeError:
-        logger.warning("[asset_class_analysis] Failed to parse LLM response")
-        analysis = {
-            "diversification_score": div_score,
-            "diversification_assessment": "MODERATE",
-            "correlation_insights": [],
-            "anti_correlations": anti_correlations,
-            "high_correlations": high_correlations,
-            "concentration_risks": [],
-            "recommended_mix": [],
-            "portfolio_metrics": {},
-            "summary": "Statistical analysis completed; LLM interpretation unavailable.",
-        }
-
-    # Always attach raw statistical data
-    analysis["_raw_stats"] = {
-        "correlations": correlations,
-        "r_squared": r_squared_map,
-        "volatilities": volatilities,
+        "concentration_risks": concentration_risks,
+        "recommended_mix": recommended_mix,
+        "_raw_stats": {
+            "correlations": correlations,
+            "r_squared": r_squared_map,
+            "volatilities": volatilities,
+        },
     }
 
     logger.info(
         "[asset_class_analysis] Done: div_score=%s pairs=%d anti_corr=%d",
-        analysis.get("diversification_score", div_score),
-        len(correlations), len(anti_correlations),
+        div_score, len(correlations), len(anti_correlations),
     )
 
     return {"asset_class_analysis": analysis}

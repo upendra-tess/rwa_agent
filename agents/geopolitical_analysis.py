@@ -11,6 +11,8 @@ Sources: GDELT, GDELT tone/topic scoring + internal NLP,
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from agents.utils import extract_json
 
 from bedrock_client import BedrockClient
 from state import MultiAgentState
@@ -46,6 +48,8 @@ Given news articles, social sentiment, and policy data, produce a structured geo
 5. SOCIAL_SENTIMENT: Public/community sentiment on RWA regulation and adoption
 6. REGIONAL_RISK_MAP: Risk assessment by major region (US, EU, APAC, EM)
 
+IMPORTANT: Keep ALL text fields under 25 words. Be concise.
+
 Return ONLY valid JSON:
 {
   "regulatory_landscape": {"summary": "<string>", "us_outlook": "<FAVORABLE|NEUTRAL|HOSTILE>", "eu_outlook": "<FAVORABLE|NEUTRAL|HOSTILE>", "apac_outlook": "<FAVORABLE|NEUTRAL|HOSTILE>"},
@@ -66,48 +70,57 @@ def geopolitical_analysis_agent(state: MultiAgentState) -> dict:
     customer = state.get("customer_profile", {})
     region = customer.get("region", "US")
 
-    # Fetch geopolitical data
+    # Fetch all geopolitical data in parallel
+    queries = GDELT_QUERIES[:3]
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        # GDELT articles + tones (3 queries x 2 calls = 6)
+        f_articles = {q: pool.submit(fetch_gdelt_articles, q, 15, "14d") for q in queries}
+        f_tones = {q: pool.submit(fetch_gdelt_tone, q, "30d") for q in queries}
+        # Social sentiment
+        f_reddit_crypto = pool.submit(fetch_reddit_sentiment, "cryptocurrency", "RWA tokenization", 15)
+        f_reddit_defi = pool.submit(fetch_reddit_sentiment, "defi", "real world assets", 10)
+        f_bluesky = pool.submit(fetch_bluesky_posts, "RWA tokenization regulation", 15)
+        # Policy/trade context
+        f_imf = pool.submit(fetch_imf_indicators, "FM", "FPOLM_PA", ["USA", "GBR", "DEU", "JPN", "CHN"])
+        f_trade = pool.submit(fetch_un_comtrade)
+        f_wb = pool.submit(fetch_world_bank_indicator, "CC.EST", "US")
+
     all_articles = []
     all_tones = {}
-    for query in GDELT_QUERIES[:3]:  # Limit to avoid rate limits
-        articles = fetch_gdelt_articles(query, max_records=15, timespan="14d")
-        all_articles.extend(articles)
-        tone = fetch_gdelt_tone(query, timespan="30d")
+    for q in queries:
+        all_articles.extend(f_articles[q].result())
+        tone = f_tones[q].result()
         if tone:
-            all_tones[query] = tone
+            all_tones[q] = tone
 
-    # Social sentiment
-    reddit_crypto = fetch_reddit_sentiment("cryptocurrency", "RWA tokenization", 15)
-    reddit_defi = fetch_reddit_sentiment("defi", "real world assets", 10)
-    bluesky = fetch_bluesky_posts("RWA tokenization regulation", 15)
-
-    # Policy/trade context
-    imf_rates = fetch_imf_indicators("FM", "FPOLM_PA", ["USA", "GBR", "DEU", "JPN", "CHN"])
-    trade = fetch_un_comtrade()
-    wb_governance = fetch_world_bank_indicator("CC.EST", "US")  # Control of corruption
+    reddit_crypto = f_reddit_crypto.result()
+    reddit_defi = f_reddit_defi.result()
+    bluesky = f_bluesky.result()
+    imf_rates = f_imf.result()
+    trade = f_trade.result()
+    wb_governance = f_wb.result()
 
     data_context = {
         "customer_region": region,
         "macro_regime": macro.get("macro_regime", "UNKNOWN"),
         "gdelt_articles": [
-            {"title": a["title"], "source": a["source"], "tone": a["tone"],
-             "date": a["date"]}
-            for a in all_articles[:25]
+            {"title": a["title"], "tone": a["tone"]}
+            for a in all_articles[:12]
         ],
         "gdelt_tone_analysis": all_tones,
         "reddit_sentiment": {
             "crypto_sub": [
                 {"title": p["title"], "score": p["score"]}
-                for p in reddit_crypto[:10]
+                for p in reddit_crypto[:5]
             ],
             "defi_sub": [
                 {"title": p["title"], "score": p["score"]}
-                for p in reddit_defi[:10]
+                for p in reddit_defi[:5]
             ],
         },
         "bluesky_posts": [
-            {"text": p["text"][:200], "likes": p["like_count"]}
-            for p in bluesky[:10]
+            {"text": p["text"][:100], "likes": p["like_count"]}
+            for p in bluesky[:5]
         ],
         "imf_policy_rates": imf_rates,
         "us_trade_balance": trade,
@@ -117,22 +130,15 @@ def geopolitical_analysis_agent(state: MultiAgentState) -> dict:
     prompt = (
         "Analyze the geopolitical and regulatory environment for RWA investments "
         f"(customer region: {region}):\n\n"
-        f"{json.dumps(data_context, indent=2, default=str)}"
+        f"{json.dumps(data_context, default=str)}"
     )
 
-    raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
-
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
+    logger.info("[geopolitical_analysis] Sending to LLM for analysis...")
     try:
-        analysis = json.loads(text)
-    except json.JSONDecodeError:
+        raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
+        logger.info("[geopolitical_analysis] LLM response received, parsing...")
+        analysis = extract_json(raw)
+    except Exception as e:
         logger.warning("[geopolitical_analysis] Failed to parse LLM response")
         analysis = {
             "overall_score": 50,
@@ -144,6 +150,19 @@ def geopolitical_analysis_agent(state: MultiAgentState) -> dict:
             "social_sentiment": {"overall": "NEUTRAL", "summary": "Unavailable"},
             "regional_risk_map": [],
         }
+
+    # Attach raw signals for qualitative context in output
+    analysis["_key_signals"] = {
+        "gdelt_top_articles": [
+            {"title": a["title"], "tone": a["tone"], "source": a["source"]}
+            for a in all_articles[:5] if a.get("title")
+        ],
+        "gdelt_tones": all_tones,
+        "reddit_top": [
+            p["title"] for p in (reddit_crypto + reddit_defi)[:3] if p.get("title")
+        ],
+        "imf_policy_rates": imf_rates,
+    }
 
     logger.info(
         "[geopolitical_analysis] Done: score=%s risk=%s",

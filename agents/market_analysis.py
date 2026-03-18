@@ -12,6 +12,8 @@ Sources: GDELT, Alpha Vantage News & Sentiment, NewsAPI,
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from agents.utils import extract_json
 
 from bedrock_client import BedrockClient
 from state import MultiAgentState
@@ -37,6 +39,8 @@ Given news, sentiment, social signals, and on-chain data, produce a market analy
 5. RWA_SPECIFIC_SIGNALS: RWA-specific market signals (new protocols, TVL growth, yield trends)
 6. MARKET_RISKS: Key market risks and potential catalysts
 
+IMPORTANT: Keep ALL text fields under 25 words. Be concise.
+
 Return ONLY valid JSON:
 {
   "news_sentiment": {"score": <-1.0 to 1.0>, "label": "<VERY_BEARISH|BEARISH|NEUTRAL|BULLISH|VERY_BULLISH>", "key_headlines": [<strings>], "summary": "<string>"},
@@ -56,29 +60,37 @@ def market_analysis_agent(state: MultiAgentState) -> dict:
     macro = state.get("macro_context", {})
     rwa_universe = state.get("rwa_universe", [])
 
-    # Fetch news data
-    gdelt_rwa = fetch_gdelt_articles("RWA tokenization real world assets", 20, "7d")
-    gdelt_crypto = fetch_gdelt_articles("cryptocurrency blockchain market", 20, "7d")
-    gdelt_tone_rwa = fetch_gdelt_tone("RWA tokenization", "30d")
-    gdelt_tone_crypto = fetch_gdelt_tone("cryptocurrency market", "30d")
-
-    av_news = fetch_alpha_vantage_news(
-        tickers="CRYPTO:BTC,CRYPTO:ETH",
-        topics="blockchain,financial_markets",
-        limit=15,
-    )
-    newsapi = fetch_newsapi_articles("RWA tokenization real world assets crypto", page_size=15)
-
-    # Social data
-    reddit = fetch_reddit_sentiment("cryptocurrency", "RWA real world assets", 15)
-    bluesky = fetch_bluesky_posts("RWA tokenization crypto", 15)
-
-    # On-chain data
-    protocols = fetch_defillama_protocols(30)
-    stables = fetch_defillama_stablecoins()
+    # Fetch all data sources in parallel
     gecko_ids = [a["gecko_id"] for a in rwa_universe if a.get("gecko_id")][:20]
-    rwa_tokens = fetch_coingecko_market(gecko_ids) if gecko_ids else []
-    dex_pools = fetch_gecko_terminal_pools("eth", 15)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        # News data
+        f_gdelt_rwa = pool.submit(fetch_gdelt_articles, "RWA tokenization real world assets", 20, "7d")
+        f_gdelt_crypto = pool.submit(fetch_gdelt_articles, "cryptocurrency blockchain market", 20, "7d")
+        f_tone_rwa = pool.submit(fetch_gdelt_tone, "RWA tokenization", "30d")
+        f_tone_crypto = pool.submit(fetch_gdelt_tone, "cryptocurrency market", "30d")
+        f_av = pool.submit(lambda: fetch_alpha_vantage_news(tickers="CRYPTO:BTC,CRYPTO:ETH", topics="blockchain,financial_markets", limit=15))
+        f_newsapi = pool.submit(lambda: fetch_newsapi_articles("RWA tokenization real world assets crypto", page_size=15))
+        # Social data
+        f_reddit = pool.submit(fetch_reddit_sentiment, "cryptocurrency", "RWA real world assets", 15)
+        f_bluesky = pool.submit(fetch_bluesky_posts, "RWA tokenization crypto", 15)
+        # On-chain data
+        f_protocols = pool.submit(fetch_defillama_protocols, 30)
+        f_stables = pool.submit(fetch_defillama_stablecoins)
+        f_tokens = pool.submit(fetch_coingecko_market, gecko_ids) if gecko_ids else None
+        f_dex = pool.submit(fetch_gecko_terminal_pools, "eth", 15)
+
+    gdelt_rwa = f_gdelt_rwa.result()
+    gdelt_crypto = f_gdelt_crypto.result()
+    gdelt_tone_rwa = f_tone_rwa.result()
+    gdelt_tone_crypto = f_tone_crypto.result()
+    av_news = f_av.result()
+    newsapi = f_newsapi.result()
+    reddit = f_reddit.result()
+    bluesky = f_bluesky.result()
+    protocols = f_protocols.result()
+    stables = f_stables.result()
+    rwa_tokens = f_tokens.result() if f_tokens else []
+    dex_pools = f_dex.result()
 
     # Alpha Vantage sentiment aggregation
     av_scores = [a["overall_sentiment_score"] for a in av_news
@@ -89,12 +101,12 @@ def market_analysis_agent(state: MultiAgentState) -> dict:
         "macro_regime": macro.get("macro_regime", "UNKNOWN"),
         "rate_environment": macro.get("rate_environment", "UNKNOWN"),
         "gdelt_rwa_articles": [
-            {"title": a["title"], "tone": a["tone"], "source": a["source"]}
-            for a in gdelt_rwa[:12]
+            {"title": a["title"], "tone": a["tone"]}
+            for a in gdelt_rwa[:8]
         ],
         "gdelt_crypto_articles": [
             {"title": a["title"], "tone": a["tone"]}
-            for a in gdelt_crypto[:10]
+            for a in gdelt_crypto[:5]
         ],
         "gdelt_tones": {
             "rwa": gdelt_tone_rwa,
@@ -104,26 +116,25 @@ def market_analysis_agent(state: MultiAgentState) -> dict:
             "avg_sentiment": round(avg_av_sentiment, 3),
             "articles": [
                 {"title": a["title"], "sentiment": a["overall_sentiment_label"]}
-                for a in av_news[:8]
+                for a in av_news[:5]
             ],
         },
         "newsapi_articles": [
-            {"title": a["title"], "source": a["source"]}
-            for a in newsapi[:8]
+            {"title": a["title"]}
+            for a in newsapi[:5]
         ],
         "reddit_posts": [
-            {"title": p["title"], "score": p["score"], "comments": p["num_comments"]}
-            for p in reddit[:10]
+            {"title": p["title"], "score": p["score"]}
+            for p in reddit[:5]
         ],
         "bluesky_posts": [
-            {"text": p["text"][:200], "likes": p["like_count"]}
-            for p in bluesky[:10]
+            {"text": p["text"][:100], "likes": p["like_count"]}
+            for p in bluesky[:5]
         ],
         "rwa_token_prices": [
-            {"symbol": t["symbol"], "price": t["price"],
-             "change_24h": t["change_24h"], "change_30d": t["change_30d"],
-             "volume_24h": t["volume_24h"], "market_cap": t["market_cap"]}
-            for t in rwa_tokens
+            {"symbol": t["symbol"], "change_24h": t["change_24h"],
+             "change_30d": t["change_30d"], "market_cap": t["market_cap"]}
+            for t in rwa_tokens[:8]
         ],
         "stablecoin_mcap": stables.get("total_stablecoin_mcap", 0),
         "total_defi_tvl": sum(p["tvl"] or 0 for p in protocols),
@@ -131,28 +142,21 @@ def market_analysis_agent(state: MultiAgentState) -> dict:
         "rwa_universe_count": len(rwa_universe),
         "top_dex_pools": [
             {"name": p["name"], "volume_24h": p["volume_24h"]}
-            for p in dex_pools[:8]
+            for p in dex_pools[:5]
         ],
     }
 
     prompt = (
         "Analyze the market sentiment and conditions for RWA investments:\n\n"
-        f"{json.dumps(data_context, indent=2, default=str)}"
+        f"{json.dumps(data_context, default=str)}"
     )
 
-    raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
-
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
+    logger.info("[market_analysis] Sending to LLM for analysis...")
     try:
-        analysis = json.loads(text)
-    except json.JSONDecodeError:
+        raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
+        logger.info("[market_analysis] LLM response received, parsing...")
+        analysis = extract_json(raw)
+    except Exception as e:
         logger.warning("[market_analysis] Failed to parse LLM response")
         analysis = {
             "overall_score": 50,

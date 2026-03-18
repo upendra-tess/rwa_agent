@@ -692,9 +692,9 @@ def fetch_un_comtrade(reporter: str = "842", partner: str = "0",
         return {}
     records = data["data"]
     exports = sum(r.get("primaryValue", 0) or 0 for r in records
-                  if r.get("flowDesc", "").startswith("Export"))
+                  if (r.get("flowDesc") or "").startswith("Export"))
     imports = sum(r.get("primaryValue", 0) or 0 for r in records
-                  if r.get("flowDesc", "").startswith("Import"))
+                  if (r.get("flowDesc") or "").startswith("Import"))
     return {
         "period": period, "exports_usd": exports, "imports_usd": imports,
         "trade_balance": exports - imports,

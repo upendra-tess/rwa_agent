@@ -10,6 +10,8 @@ Sources: FRED, IMF API, World Bank, ECB Data Portal, GDPNow/FRED,
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from agents.utils import extract_json
 
 from bedrock_client import BedrockClient
 from state import MultiAgentState
@@ -34,6 +36,8 @@ Given the macro context and raw data, produce a structured industry analysis cov
 5. LIQUIDITY_ASSESSMENT: Liquidity depth by chain and platform
 6. INDUSTRY_RISKS: Key risks to the RWA tokenization industry
 
+IMPORTANT: Keep ALL text fields under 25 words. Be concise.
+
 Return ONLY valid JSON:
 {
   "sector_growth": {"summary": "<string>", "score": <1-10>, "details": [<strings>]},
@@ -53,17 +57,26 @@ def industry_analysis_agent(state: MultiAgentState) -> dict:
     macro = state.get("macro_context", {})
     rwa_universe = state.get("rwa_universe", [])
 
-    # Fetch supplementary data
-    protocols = fetch_defillama_protocols(50)
-    chains = fetch_defillama_chains()
-    dex_pools = fetch_gecko_terminal_pools("eth", 15)
-    gdpnow = fetch_gdpnow()
-    wb_gdp = fetch_world_bank_indicator("NY.GDP.MKTP.KD.ZG", "US")
-    ecb = fetch_ecb_rates()
-
-    # Fetch CoinGecko prices for RWA tokens that have gecko_ids
+    # Fetch supplementary data in parallel
     gecko_ids = [a["gecko_id"] for a in rwa_universe if a.get("gecko_id")][:20]
-    rwa_tokens = fetch_coingecko_market(gecko_ids) if gecko_ids else []
+    futures = {}
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        futures["protocols"] = pool.submit(fetch_defillama_protocols, 50)
+        futures["chains"] = pool.submit(fetch_defillama_chains)
+        futures["dex_pools"] = pool.submit(fetch_gecko_terminal_pools, "eth", 15)
+        futures["gdpnow"] = pool.submit(fetch_gdpnow)
+        futures["wb_gdp"] = pool.submit(fetch_world_bank_indicator, "NY.GDP.MKTP.KD.ZG", "US")
+        futures["ecb"] = pool.submit(fetch_ecb_rates)
+        if gecko_ids:
+            futures["rwa_tokens"] = pool.submit(fetch_coingecko_market, gecko_ids)
+
+    protocols = futures["protocols"].result()
+    chains = futures["chains"].result()
+    dex_pools = futures["dex_pools"].result()
+    gdpnow = futures["gdpnow"].result()
+    wb_gdp = futures["wb_gdp"].result()
+    ecb = futures["ecb"].result()
+    rwa_tokens = futures["rwa_tokens"].result() if "rwa_tokens" in futures else []
 
     # Aggregate RWA universe by asset type and chain
     by_asset_type = {}
@@ -90,52 +103,42 @@ def industry_analysis_agent(state: MultiAgentState) -> dict:
             "total_protocols": len(rwa_universe),
             "total_tvl": sum(a["tvl"] for a in rwa_universe),
             "by_asset_type": by_asset_type,
-            "by_chain": dict(sorted(by_chain.items(), key=lambda x: x[1]["tvl"], reverse=True)[:10]),
+            "by_chain": dict(sorted(by_chain.items(), key=lambda x: x[1]["tvl"], reverse=True)[:5]),
         },
         "top_rwa_protocols": [
             {"name": a["name"], "tvl": a["tvl"], "asset_type": a["asset_type"],
-             "chain": a["chain"], "change_7d": a.get("change_7d")}
-            for a in rwa_universe[:20]
+             "change_7d": a.get("change_7d")}
+            for a in rwa_universe[:10]
         ],
         "rwa_token_prices": [
-            {"symbol": t["symbol"], "price": t["price"],
-             "market_cap": t["market_cap"], "change_30d": t.get("change_30d")}
-            for t in rwa_tokens[:15]
+            {"symbol": t["symbol"], "market_cap": t["market_cap"], "change_30d": t.get("change_30d")}
+            for t in rwa_tokens[:8]
         ],
         "top_defi_protocols": [
-            {"name": p["name"], "tvl": p["tvl"], "category": p["category"],
-             "change_7d": p["change_7d"]}
-            for p in protocols[:10]
+            {"name": p["name"], "tvl": p["tvl"], "category": p["category"]}
+            for p in protocols[:5]
         ],
         "chain_tvl": [
             {"name": c["name"], "tvl": c["tvl"]}
-            for c in chains[:10]
+            for c in chains[:5]
         ],
         "dex_activity": [
             {"name": p["name"], "volume_24h": p["volume_24h"]}
-            for p in dex_pools[:10]
+            for p in dex_pools[:5]
         ],
     }
 
     prompt = (
         "Analyze the RWA tokenization industry based on this data:\n\n"
-        f"{json.dumps(data_context, indent=2, default=str)}"
+        f"{json.dumps(data_context, default=str)}"
     )
 
-    raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
-
-    # Parse response
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
+    logger.info("[industry_analysis] Sending to LLM for analysis...")
     try:
-        analysis = json.loads(text)
-    except json.JSONDecodeError:
+        raw = bedrock.send_message(prompt, system_prompt=ANALYSIS_SYSTEM_PROMPT)
+        logger.info("[industry_analysis] LLM response received, parsing...")
+        analysis = extract_json(raw)
+    except Exception as e:
         logger.warning("[industry_analysis] Failed to parse LLM response")
         analysis = {
             "overall_score": 50,
