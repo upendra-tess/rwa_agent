@@ -1,10 +1,15 @@
 """
 agent_graph.py - LangGraph Multi-Agent Pipeline
 =================================================
-Orchestrates the full RWA investment analysis pipeline:
+TWO graph modes:
 
-  Customer Profiling -> Macro Analysis -> [5 Parallel Agents] -> Match Asset
-  -> Asset Class Analysis -> Asset Analysis -> Final Output
+1. FULL GRAPH (build_graph) — used by scheduler for cache refresh:
+   Customer Profiling -> Macro Analysis -> [5 Parallel Agents] -> Match Asset
+   -> Asset Class Analysis -> Asset Analysis -> Final Output
+
+2. FAST GRAPH (build_fast_graph) — used for user requests (reads from cache):
+   Customer Profiling -> Match Asset -> Asset Class Analysis -> Asset Analysis -> END
+   (macro + 5 parallel agents are pre-computed and injected from cache)
 
 The 5 parallel agents (fan-out / fan-in):
   - Industry Analysis Agent
@@ -12,10 +17,6 @@ The 5 parallel agents (fan-out / fan-in):
   - Cash Flow Agent
   - Geopolitical Analysis Agent
   - Market Analysis Agent
-
-LangGraph handles parallel execution natively:
-  - Multiple edges from macro_analysis to the 5 agents = fan-out
-  - Multiple edges from the 5 agents to match_asset = fan-in (waits for all)
 """
 
 import logging
@@ -40,7 +41,9 @@ logger = logging.getLogger(__name__)
 
 def build_graph():
     """
-    Build and compile the multi-agent LangGraph pipeline.
+    Build and compile the FULL multi-agent LangGraph pipeline.
+    Used by the scheduler for cache refresh — runs ALL agents including
+    live API calls and LLM inference.
 
     Graph topology:
         customer_profiling
@@ -96,6 +99,49 @@ def build_graph():
     graph.add_edge("market_analysis", "match_asset")
 
     # --- Sequential: match -> asset_class -> asset_analysis -> END ---
+    graph.add_edge("match_asset", "asset_class_analysis")
+    graph.add_edge("asset_class_analysis", "asset_analysis")
+    graph.add_edge("asset_analysis", END)
+
+    return graph.compile()
+
+
+def build_fast_graph():
+    """
+    Build and compile the FAST user-facing graph.
+    Skips macro + 5 parallel agents (those come from cache).
+
+    Graph topology:
+        customer_profiling
+              |
+        match_asset          (cache provides macro + 5 analysis results)
+              |
+        asset_class_analysis
+              |
+        asset_analysis
+              |
+             END
+
+    The initial_state must be pre-populated with cached values for:
+      - rwa_universe
+      - macro_context
+      - industry_analysis
+      - financial_analysis
+      - cashflow_analysis
+      - geopolitical_analysis
+      - market_analysis
+    """
+    graph = StateGraph(MultiAgentState)
+
+    # Only the user-specific agents
+    graph.add_node("customer_profiling", customer_profiling_agent)
+    graph.add_node("match_asset", match_asset_agent)
+    graph.add_node("asset_class_analysis", asset_class_analysis_agent)
+    graph.add_node("asset_analysis", asset_analysis_agent)
+
+    # Linear pipeline
+    graph.set_entry_point("customer_profiling")
+    graph.add_edge("customer_profiling", "match_asset")
     graph.add_edge("match_asset", "asset_class_analysis")
     graph.add_edge("asset_class_analysis", "asset_analysis")
     graph.add_edge("asset_analysis", END)
