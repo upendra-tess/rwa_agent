@@ -364,6 +364,95 @@ def fetch_gecko_terminal_pools(network: str = "eth", top_n: int = 20) -> list:
 # RWA SOURCES  (Primary: DefiLlama RWA category — the live RWA universe)
 # ============================================================================
 
+# --- KYC Metadata from DefiLlama GitHub (protocols.ts) ---
+# Cache for parsed KYC metadata: { defillama_protocol_id: { kyc, transferable, ... } }
+_kyc_metadata_cache: dict = {}
+_kyc_cache_timestamp: float = 0
+_KYC_CACHE_TTL = 3600  # 1 hour
+
+DEFILLAMA_RWA_PROTOCOLS_URL = (
+    "https://raw.githubusercontent.com/DefiLlama/defillama-server/"
+    "master/defi/src/rwa/protocols.ts"
+)
+
+
+def fetch_defillama_kyc_metadata() -> dict:
+    """
+    Fetch and parse DefiLlama's RWA protocol KYC metadata from GitHub.
+    Source: defillama-server/defi/src/rwa/protocols.ts
+
+    This is the SAME data DefiLlama uses for the 'Access Model' column
+    (Permissionless / Permissioned) on their RWA dashboard.
+
+    Returns dict: { protocol_id_str: { kyc: bool, transferable: bool, ... } }
+    """
+    global _kyc_metadata_cache, _kyc_cache_timestamp
+    now = time.time()
+
+    # Return cache if fresh
+    if _kyc_metadata_cache and (now - _kyc_cache_timestamp) < _KYC_CACHE_TTL:
+        return _kyc_metadata_cache
+
+    text = _http_get_text(DEFILLAMA_RWA_PROTOCOLS_URL)
+    if not text:
+        logger.warning("[data_sources] Failed to fetch DefiLlama KYC metadata")
+        return _kyc_metadata_cache  # return stale cache if available
+
+    import re
+    metadata = {}
+
+    # Parse TypeScript object entries like: "2542": { ... kyc: true, transferable: true ... }
+    # Pattern: "ID": { ... }
+    block_pattern = re.compile(
+        r'"(\d+)":\s*\{([^}]+)\}', re.DOTALL
+    )
+
+    for match in block_pattern.finditer(text):
+        protocol_id = match.group(1)
+        block = match.group(2)
+
+        entry = {}
+        for field in ["kyc", "transferable", "redeemable", "attestations",
+                       "cexListed", "selfCustody"]:
+            # Match field: true/false
+            field_match = re.search(rf'{field}\s*:\s*(true|false)', block)
+            if field_match:
+                entry[field] = field_match.group(1) == "true"
+
+        if entry:
+            metadata[protocol_id] = entry
+
+    if metadata:
+        _kyc_metadata_cache = metadata
+        _kyc_cache_timestamp = now
+        logger.info(
+            "[data_sources] Loaded KYC metadata for %d RWA protocols "
+            "(permissionless: %d, kyc-required: %d)",
+            len(metadata),
+            sum(1 for m in metadata.values() if not m.get("kyc", True)),
+            sum(1 for m in metadata.values() if m.get("kyc", True)),
+        )
+
+    return metadata
+
+
+def get_access_model(protocol_id: str, kyc_metadata: dict = None) -> str:
+    """
+    Determine access model for a protocol.
+    Returns: 'permissionless', 'permissioned', or 'unknown'
+    """
+    if kyc_metadata is None:
+        kyc_metadata = fetch_defillama_kyc_metadata()
+
+    meta = kyc_metadata.get(str(protocol_id))
+    if not meta:
+        return "unknown"
+
+    if not meta.get("kyc", True):
+        return "permissionless"
+    return "permissioned"
+
+
 # Asset-type classification heuristics (applied to DefiLlama RWA protocols)
 _ASSET_TYPE_KEYWORDS = {
     "treasury": ["treasury", "tbill", "t-bill", "ustb", "buidl", "usyc",
@@ -393,19 +482,30 @@ def _classify_rwa_asset_type(name: str, description: str = "",
     return "other"
 
 
-def fetch_rwa_universe(min_tvl_usd: float = 1_000_000) -> list:
+def fetch_rwa_universe(min_tvl_usd: float = 1_000_000,
+                        access_filter: str = None) -> list:
     """
     Fetch the LIVE RWA asset universe from DefiLlama.
     This is the SINGLE SOURCE OF TRUTH for all assets in the pipeline.
 
+    Args:
+        min_tvl_usd: Minimum TVL to include.
+        access_filter: Optional filter —
+            'permissionless' = only non-KYC tokens,
+            'permissioned'   = only KYC-required tokens,
+            None             = all tokens.
+
     Returns all RWA, RWA Lending, and Treasury Manager protocols with TVL >= min_tvl_usd.
     Each entry includes: name, slug, tvl, chain, chains, category, asset_type,
-    gecko_id, symbol, description, change_1d, change_7d, mcap.
+    gecko_id, symbol, description, change_1d, change_7d, mcap, kyc, access_model.
     """
     data = _http_get(f"{DEFILLAMA_BASE}/protocols")
     if not data or not isinstance(data, list):
         logger.warning("[data_sources] Failed to fetch DefiLlama protocols")
         return []
+
+    # Fetch KYC metadata from DefiLlama GitHub
+    kyc_metadata = fetch_defillama_kyc_metadata()
 
     rwa_categories = {"rwa", "rwa lending", "treasury manager"}
     rwa_protocols = [
@@ -419,7 +519,20 @@ def fetch_rwa_universe(min_tvl_usd: float = 1_000_000) -> list:
         name = p.get("name", "")
         desc = p.get("description", "") or ""
         cat = p.get("category", "") or ""
+        protocol_id = str(p.get("id", ""))
         asset_type = _classify_rwa_asset_type(name, desc, cat)
+
+        # KYC classification from DefiLlama protocols.ts
+        access = get_access_model(protocol_id, kyc_metadata)
+        kyc_meta = kyc_metadata.get(protocol_id, {})
+        requires_kyc = kyc_meta.get("kyc", None)  # None = unknown
+
+        # Apply access filter if requested
+        if access_filter:
+            if access_filter == "permissionless" and access != "permissionless":
+                continue
+            elif access_filter == "permissioned" and access != "permissioned":
+                continue
 
         universe.append({
             "name": name,
@@ -437,11 +550,16 @@ def fetch_rwa_universe(min_tvl_usd: float = 1_000_000) -> list:
             "audits": p.get("audits") or 0,
             "change_1d": p.get("change_1d"),
             "change_7d": p.get("change_7d"),
+            # KYC / Access Model fields
+            "kyc": requires_kyc,
+            "transferable": kyc_meta.get("transferable"),
+            "access_model": access,
         })
 
     logger.info(
-        "[data_sources] RWA universe: %d protocols, total TVL $%.1fB",
+        "[data_sources] RWA universe: %d protocols (filter=%s), total TVL $%.1fB",
         len(universe),
+        access_filter or "all",
         sum(a["tvl"] for a in universe) / 1e9,
     )
     return universe
